@@ -5,43 +5,55 @@ from time import sleep
 import requests
 
 
-GITHUB_API_URL = 'https://api.github.com'
-FORECAST_API_URL = 'https://api.forecast.it/api/v1'
+FORECAST_HOST = 'https://api.forecast.it'
+
+GITHUB_HOST = 'https://api.github.com'
+GITHUB_PREVIEW_HEADERS = {'Accept': 'application/vnd.github.inertia-preview+json'}  # custom header while Projects is still in preview
 
 
-def pull_forecast_cards(api_key, project_id, sprint_id, comments):
+def pull_forecast_cards(session, project_id, sprint_id, workflow_column_id, comments):
     """ Request Forecast cards from api
     when comments is set, send another request for each card to also get the comments
     returns a list of cards
     """
-    headers = {'X-FORECAST-API-KEY': api_key}#TODO requests session with headers and host
-
     # Pull cards
-    url = f'/projects/{project_id}/cards' if project_id else '/cards'
-    print('requesting cards')
-    cards_response = requests.get(FORECAST_API_URL + url, headers=headers)
-    cards = cards_response.json()
+    if project_id:
+        url = f'{FORECAST_HOST}/api/v1/projects/{project_id}/cards'
+    else:
+        url = f'{FORECAST_HOST}/api/v1/cards'
 
-    # filter by sprint
+    print('requesting cards')
+    cards = session.get(url).json()
+
+    # Filter by sprint
     if sprint_id:
         cards = [card for card in cards if card['sprint'] == sprint_id]
 
-    if comments:
-        for card in cards[:10]:#TODO remove limit
-            print(f'requesting comments for card {card["id"]}')
-            card['comments'] = requests.get(FORECAST_API_URL + f'/cards/{card["id"]}/comments', headers=headers).json()
+    # Filter by workflow column
+    if workflow_column_id:
+        cards = [card for card in cards if card['workflow_column'] == workflow_column_id]
 
+    # Request comments for each card
+    card_counter = 0
+    if comments:
+        print(f'requesting comments for every cards')
+        for card in cards:
+            card['comments'] = session.get(f'{FORECAST_HOST}/api/v1/cards/{card["id"]}/comments').json()
+            card_counter += len(card['comments'])
+
+    print(f'downloaded {len(cards)} and {card_counter} comments')
     return cards
 
 
-def pull_forecast_persons(api_key):
+def pull_forecast_persons(session):
     """ Request forecast persons from api
     returns an id -> person mapping
     """
-    headers = {'X-FORECAST-API-KEY': api_key}#TODO requests session with headers and host
     print('requesting persons')
-    response = requests.get(FORECAST_API_URL + '/persons', headers=headers)
-    return {person['id']: person for person in response.json()}
+    response = session.get(f'{FORECAST_HOST}/api/v1/persons').json()
+
+    print(f'downloaded {len(response)} persons')
+    return {person['id']: person for person in response}
 
 
 def prefix_author(body, person):
@@ -61,59 +73,60 @@ def convert_card_to_issue(card, label, persons):
     return issue
 
 
-def push_github_issues(issues, username, token, owner, repository, throttle, project_number):
+def get_project_column_id(session, owner, repository, throttle, project_number):
+    """
+    """
+    # List repository projects and look for the one with the correct number
+    print('listing repository projects')
+    projects_url = f'{GITHUB_HOST}/repos/{owner}/{repository}/projects'
+    for project in session.get(projects_url, headers=GITHUB_PREVIEW_HEADERS).json():
+        if project['number'] == project_number:
+            project_id = project['id']
+            break
+    else:
+        raise Exception(f'Could not find project number {project_number} in {owner}/{repository}')
+
+    # Get the id of the first column in the project
+    print(f'listing project {project["name"]} columns')
+    project_columns_url = f'{GITHUB_HOST}/projects/{project_id}/columns'
+    project_columns = session.get(project_columns_url, headers=GITHUB_PREVIEW_HEADERS).json()
+    if not project_columns:
+        raise Exception('Github project must have at least one column')
+
+    print(f'using column {project_columns[0]["name"]}')
+    return project_columns[0]['id']
+
+
+def push_github_issues(session, issues, owner, repository, throttle, project_number):
     """ Push batches of issues to a Github repository """
-    auth = requests.auth.HTTPBasicAuth(username, token)
-
-    throttle /= 1000  # sleep expects seconds
-
-    # If a project was given: get the id of the first column
     if project_number:
-        headers = {'Accept': 'application/vnd.github.inertia-preview+json'}  # custom header while Projects is still in preview
+        project_column_id = get_project_column_id(session, owner, repository, throttle, project_number)
 
-        projects_url = f'/repos/{owner}/{repository}/projects'
-        print(projects_url)
-        projects = requests.get(GITHUB_API_URL + projects_url, auth=auth, headers=headers).json()
-        print(projects)
-        for project in projects:
-            if project['number'] == project_number:
-                project_id = project['id']
-                break
-        else:
-            raise Exception(f'Could not find project number {project_number} in {owner}/{repository}')
+    issue_url = f'{GITHUB_HOST}/repos/{owner}/{repository}/issues'
 
-        project_columns_url = f'/projects/{project_id}/columns'
-        project_columns = requests.get(GITHUB_API_URL + project_columns_url, auth=auth, headers=headers).json()
-        if not project_columns:
-            raise Exception('Github project must have at least one column')
-
-        project_column_id = project_columns[0]['id']
-
-    issue_url = f'/repos/{owner}/{repository}/issues'
-
-    for issue in issues:
+    issue_count = len(issues)
+    for counter, issue in enumerate(issues, 1):
+        print(f'creating issues ({counter}/{issue_count})', end='\r')
         sleep(throttle)
-        issue_response = requests.post(GITHUB_API_URL + issue_url, json=issue, auth=auth).json()
+        issue_response = session.post(issue_url, json=issue).json()
 
-        comment_url = f'/repos/{owner}/{repository}/issues/{issue_response["number"]}/comments'
+        comment_url = f'{GITHUB_HOST}/repos/{owner}/{repository}/issues/{issue_response["number"]}/comments'
 
         for comment in issue['comments']:
             data = {'body': comment}
             sleep(throttle)
-            response = requests.post(GITHUB_API_URL + comment_url, json=comment, auth=auth)
+            response = session.post(comment_url, json=comment)
 
 
         if project_number:
-            card_url = f'/projects/columns/{project_column_id}/cards'
+            card_url = f'{GITHUB_HOST}/projects/columns/{project_column_id}/cards'
             data = {
                 'content_id': issue_response['id'],
                 'content_type': 'Issue',
             }
             sleep(throttle)
-            response = requests.post(GITHUB_API_URL + card_url, json=data, auth=auth)
-
-
-        break#TODO tej
+            response = session.post(card_url, json=data, headers=GITHUB_PREVIEW_HEADERS)
+            response.raise_for_status
 
 
 if __name__ == '__main__':
@@ -129,6 +142,7 @@ if __name__ == '__main__':
     # Optional stuff
     parser.add_argument('--forecast-project', type=int, help='specify a Forecast project id to only pull cards from this project')
     parser.add_argument('--forecast-sprint', type=int, help='specify a Forecast sprint id to only pull cards from this sprint')
+    parser.add_argument('--forecast-workflow-column', type=int, help='specify a Forecast workflow column id to only pull cards from this column')
     parser.add_argument('--github-project-number', type=int, help='also add the issue to a Github Project')
     parser.add_argument('--with-comments', help='also migrate card comments (requires an extra query for each card)', action='store_true')
     parser.add_argument('--label', help='optional label to add to migrated github issues')
@@ -137,13 +151,17 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # Pull
-    cards = pull_forecast_cards(args.forecast_api_key, args.forecast_project, args.forecast_sprint, args.with_comments)
-    persons = pull_forecast_persons(args.forecast_api_key)
+    forecast_session = requests.Session()
+    forecast_session.headers['X-FORECAST-API-KEY'] = args.forecast_api_key
+    cards = pull_forecast_cards(forecast_session, args.forecast_project, args.forecast_sprint, args.forecast_workflow_column, args.with_comments)
+    persons = pull_forecast_persons(forecast_session)
 
     # Convert
     issues = [convert_card_to_issue(card, args.label, persons) for card in cards]
 
     # Push
-    push_github_issues(issues, args.github_username, args.github_token, args.github_owner, args.github_repository, args.throttle, args.github_project_number)
+    github_session = requests.Session()
+    github_session.auth= args.github_username, args.github_token
+    push_github_issues(github_session, issues, args.github_owner, args.github_repository, .001 * args.throttle, args.github_project_number)
 
     print(f'Migration completed: {len(cards)} cards migrated')

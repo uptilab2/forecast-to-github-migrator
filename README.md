@@ -1,6 +1,10 @@
 # forecast-to-github-migrator
 Migrate Forecast cards into Github issues
 
+Installation / Usage
+- python3 + requests
+- python3 main.py --help
+
 Required:
 - Forecast token
 - Github username and token, with proper scope
